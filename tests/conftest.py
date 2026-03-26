@@ -10,12 +10,20 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import datetime
 from collections.abc import Generator
 from pathlib import Path
+from urllib.parse import quote_plus
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from flask import Flask
 from flask.testing import FlaskClient
 from pytest import MonkeyPatch, fixture
+
+_OID_ORGANIZATION_IDENTIFIER = x509.ObjectIdentifier("2.5.4.97")
 
 
 @fixture
@@ -47,3 +55,43 @@ def application(allowed_client_dn: Path, monkeypatch: MonkeyPatch) -> Generator[
 def client(application: Flask) -> FlaskClient:
     """A test client for the application instance."""
     return application.test_client()
+
+
+@fixture(scope="session")
+def test_cert() -> x509.Certificate:
+    """Self-signed certificate with extended subject fields for testing."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Michigan"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test Organization"),
+        x509.NameAttribute(_OID_ORGANIZATION_IDENTIFIER, "NTRUS+MI-123456"),
+        x509.NameAttribute(NameOID.EMAIL_ADDRESS, "test@example.com"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "Test Client"),
+    ])
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.UTC))
+        .not_valid_after(datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+
+
+@fixture(scope="session")
+def test_cert_dn() -> str:
+    """Expected DN string for test_cert (DER field order, RFC 4514 escaped)."""
+    return r"C=US,ST=Michigan,O=Test Organization,organizationIdentifier=NTRUS\+MI-123456,emailAddress=test@example.com,CN=Test Client"
+
+
+@fixture(scope="session")
+def pem_header_value(test_cert: x509.Certificate) -> str:
+    """Traefik-encoded X-Forwarded-Tls-Client-Cert header value for test_cert.
+
+    Traefik strips newlines from the PEM then URL-encodes the result.
+    """
+    pem = test_cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+    return quote_plus(pem.replace("\n", "").replace("\r", ""))

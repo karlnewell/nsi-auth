@@ -17,7 +17,7 @@ import re
 import threading
 from logging.config import dictConfig
 from typing import Callable
-from urllib.parse import unquote, unquote_plus
+from urllib.parse import unquote_plus
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -51,6 +51,8 @@ class Settings(BaseSettings):
 
     allowed_client_subject_dn_path: FilePath = FilePath("/config/allowed_client_dn.txt")
     ssl_client_subject_dn_header: str = "ssl-client-subject-dn"
+    pem_header: str = "X-Forwarded-Tls-Client-Cert"
+    traefik_cert_info_header: str = "X-Forwarded-Tls-Client-Cert-Info"
     use_watchdog: bool = False
     log_level: str = "INFO"
 
@@ -118,9 +120,14 @@ def extract_dn_from_pem_header(header_value: str) -> str | None:
         # Traefik strips newlines from the PEM before URL-encoding (to prevent header injection),
         # so load_pem_x509_certificate would fail on the re-assembled string. Instead, extract
         # the base64 between the PEM markers and load as DER.
-        # Use unquote (not unquote_plus) to preserve '+' characters valid in base64.
-        pem_str = unquote(header_value)
-        b64 = re.sub(r"-----[^-]+-----", "", pem_str).replace(" ", "")
+        # unquote_plus is correct: Traefik uses url.QueryEscape which encodes spaces as '+' and
+        # base64 '+' as '%2B', so unquote_plus safely reverses both.
+        pem_str = unquote_plus(header_value)
+        # Traefik may pass the full chain; extract only the first cert's base64.
+        match = re.search(r"-----BEGIN CERTIFICATE-----([^-]*)-----END CERTIFICATE-----", pem_str)
+        if not match:
+            raise ValueError("no PEM certificate block found")
+        b64 = match.group(1).replace(" ", "")
         cert = x509.load_der_x509_certificate(base64.b64decode(b64))
     except Exception as e:
         app.logger.warning(f"failed to parse PEM from X-Forwarded-Tls-Client-Cert: {e!s}")
@@ -158,21 +165,24 @@ def get_client_dn() -> tuple[str | None, str]:
     Returns:
         Tuple of (dn, source) where source indicates which header was used.
     """
-    pem_header = request.headers.get("X-Forwarded-Tls-Client-Cert")
+    pem_header = request.headers.get(settings.pem_header)
     if pem_header:
         dn = extract_dn_from_pem_header(pem_header)
         if dn:
-            return dn, "traefik-pem"
+            app.logger.debug(f"extracted DN from {settings.pem_header} (PEM): {dn}")
+            return dn, settings.pem_header
 
-    traefik_header = request.headers.get("X-Forwarded-Tls-Client-Cert-Info")
-    if traefik_header:
-        dn = extract_dn_from_traefik_header(traefik_header)
+    traefik_cert_info_header = request.headers.get(settings.traefik_cert_info_header)
+    if traefik_cert_info_header:
+        dn = extract_dn_from_traefik_header(traefik_cert_info_header)
         if dn:
-            return dn, "traefik"
+            app.logger.debug(f"extracted DN from {settings.traefik_cert_info_header}: {dn}")
+            return dn, settings.traefik_cert_info_header
 
     nginx_header = request.headers.get(settings.ssl_client_subject_dn_header)
     if nginx_header:
-        return nginx_header, "nginx"
+        app.logger.debug(f"extracted DN from {settings.ssl_client_subject_dn_header}: {nginx_header}")
+        return nginx_header, settings.ssl_client_subject_dn_header
 
     return None, "none"
 
@@ -184,8 +194,8 @@ def validate() -> tuple[str, int]:
 
     if not dn:
         app.logger.warning(
-            f"no client DN found in headers (tried X-Forwarded-Tls-Client-Cert, "
-            f"X-Forwarded-Tls-Client-Cert-Info, {settings.ssl_client_subject_dn_header})"
+            f"no client DN found in headers (tried {settings.pem_header}, "
+            f"{settings.traefik_cert_info_header}, {settings.ssl_client_subject_dn_header})"
         )
         return "Forbidden", 403
 
