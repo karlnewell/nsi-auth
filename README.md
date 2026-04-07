@@ -68,6 +68,15 @@ volumeMounts:
     mountPath: "/config"
     readOnly: true
 
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+
 env:
   ALLOWED_CLIENT_SUBJECT_DN_PATH: "/config/allowed_client_dn.txt"
   TLS_CLIENT_SUBJECT_AUTHN_HEADER: "ssl-client-subject-dn"
@@ -124,6 +133,23 @@ trusted CA chain (see [Ingress Configuration](#4-ingress-configuration)).
 | `TLS_CLIENT_SUBJECT_AUTHN_HEADER` | HTTP header used to extract the client identity. Determines ingress mode: `ssl-client-subject-dn` (ingress-nginx, DN in RFC 2253), `X-Forwarded-Tls-Client-Cert` (Traefik, PEM certificate or comma-separated chain), or `X-Forwarded-Tls-Client-Cert-Info` (Traefik, URL-encoded cert info summary). | `ssl-client-subject-dn`         |
 | `USE_WATCHDOG`                    | Enables file-change monitoring using [watchdog](https://pypi.org/project/watchdog/). Useful for non-Kubernetes environments.                                                                                                                                                                        | `False`                         |
 | `LOG_LEVEL`                       | Logging verbosity. Options: `DEBUG`, `INFO`, `WARNING`, `ERROR`.                                                                                                                                                                                                                                    | `INFO`                          |
+
+**Health endpoint:**
+
+`nsi-auth` exposes a `/health` endpoint that returns HTTP 200. This is used
+for Kubernetes liveness and readiness probes, which are enabled by default in
+the Helm chart:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+```
 
 **File reload behavior:**
 
