@@ -246,6 +246,7 @@ def health() -> tuple[str, int]:
 @app.route("/validate", methods=["GET"])
 def validate() -> tuple[str, int]:
     """Verify the DN from the packet header against the list of allowed DN."""
+    logger.debug("validate request headers", **dict(request.headers))
     request_rfc4514_name, source = get_client_dn()
 
     if request_rfc4514_name is None:
