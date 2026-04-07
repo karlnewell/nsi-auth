@@ -24,7 +24,9 @@ from cryptography.x509 import load_pem_x509_certificate
 #
 names2oid = {}
 names2oid["sn"] = ObjectIdentifier("2.5.4.4")  # surname
+names2oid["SN"] = ObjectIdentifier("2.5.4.4")
 names2oid["gn"] = ObjectIdentifier("2.5.4.42") # givenname
+names2oid["GN"] = ObjectIdentifier("2.5.4.42")
 names2oid["organizationIdentifier"] = ObjectIdentifier("2.5.4.97")
 names2oid["emailAddress"] = ObjectIdentifier("1.2.840.113549.1.9.1")
 
