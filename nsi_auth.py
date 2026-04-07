@@ -10,37 +10,62 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+#
+# TODO:
+# - Support other HTTP proxies than NGINX + Traefik, most can send full cert.
+# - Test karl + CANARIE wildcard
+#
 """Verify DN from HTTP header against list of allowed DN's."""
 
-import base64
-import re
 import threading
 from logging.config import dictConfig
 from typing import Callable
-from urllib.parse import unquote, unquote_plus
-
 from cryptography import x509
-from cryptography.x509.oid import NameOID
 from flask import Flask, request
 from pydantic import BaseModel, FilePath
 from pydantic_settings import BaseSettings
 from watchdog.events import FileModifiedEvent, FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-# OID not included in cryptography.x509.oid.NameOID
-OID_ORGANIZATION_IDENTIFIER = x509.ObjectIdentifier("2.5.4.97")
+import rfc4514_cmp
 
-_OID_SHORT_NAMES = {
-    NameOID.COUNTRY_NAME: "C",
-    NameOID.STATE_OR_PROVINCE_NAME: "ST",
-    NameOID.LOCALITY_NAME: "L",
-    NameOID.ORGANIZATION_NAME: "O",
-    NameOID.ORGANIZATIONAL_UNIT_NAME: "OU",
-    NameOID.COMMON_NAME: "CN",
-    NameOID.SERIAL_NUMBER: "serialNumber",
-    NameOID.EMAIL_ADDRESS: "emailAddress",
-    OID_ORGANIZATION_IDENTIFIER: "organizationIdentifier",
-}
+# Client TLS certificate Subject DistinguishedName as HTTPS Header:
+# -----------------------------------------------------------------
+# Kubernetes ingress NGINX's annotation: https://github.com/kubernetes/ingress-nginx/blob/main/docs/user-guide/nginx-configuration/annotations.md
+# defined as 'The subject information of the client certificate. Example: "CN=My Client"'
+# If we ASSUME this is the $ssl_client_s_dn variable from ngx_http_ssl_module then this is
+# defined as (https://nginx.org/en/docs/http/ngx_http_ssl_module.html):
+# '$ssl_client_s_dn' returns the “subject DN” string of the client certificate for an
+#  established SSL connection according to RFC 2253 (1.11.6);'
+# So RFC2253 format. Note that itself is obsoleted by RFC4514, so NGINX has work to do.
+#
+K8S_NGINX_TLS_CLIENT_SUBJECT_DN_HEADER = "ssl-client-subject-dn"
+
+# Full Client TLS certificate as HTTPS Header:
+# --------------------------------------------
+# For Traefik:
+# * https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/passtlsclientcert/
+# * ``that contains the pem.''
+# * https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/passtlsclientcert/#pem
+# * ``The delimiters and \n will be removed.
+# * If there are more than one certificate, they are separated by a ",".''
+# * More elaborate:
+# * https://doc.traefik.io/traefik/v2.1/middlewares/passtlsclientcert/
+# * ``In the example, it is the part between -----BEGIN CERTIFICATE----- and -----END CERTIFICATE----- delimiters :''
+#
+# * k8s ingress Traefik uses this header, see https://doc.traefik.io/traefik/v1.7/configuration/backends/kubernetes/#general-annotations
+# ARNOTODO: find out if Traefik will send multiple certs if a chain is presented, see e.g.
+# Internet2's example PEM cert (or is that some form of key chain / key store)
+
+K8S_TRAEFIK_TLS_CLIENT_CERT_HEADER = "X-Forwarded-Tls-Client-Cert"
+
+# Traefik can also send the subject info from the cert:
+# * https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/passtlsclientcert/
+# * ``X-Forwarded-Tls-Client-Cert-Info header value is a string that has been escaped in order to be a valid URL query.''
+# NOTE: Traefik adminstrator must select which fields are put in this Info field! Unclear
+# what format (RFC2253/RFC4514_ is used...
+#
+K8S_TRAEFIK_TLS_CLIENT_SUBJECT_DN_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 
 
 #
@@ -49,16 +74,26 @@ _OID_SHORT_NAMES = {
 class Settings(BaseSettings):
     """Application settings."""
 
+    # ASSUME: DNs in this file are not necessarily in a X.509 DN normal form, so we'll parse
+    # flexibly. File MUST be in UTF-8 encoding, following RFC4514.
     allowed_client_subject_dn_path: FilePath = FilePath("/config/allowed_client_dn.txt")
-    ssl_client_subject_dn_header: str = "ssl-client-subject-dn"
+
+    # This setting determines behaviour, one of K8S*_HEADER, see above.
+    # If a cert header, then we check using full cert, otherwise passed subject DN.
+    tls_client_subject_authn_header: str = K8S_NGINX_TLS_CLIENT_SUBJECT_DN_HEADER
+
     use_watchdog: bool = False
     log_level: str = "INFO"
 
 
-class State(BaseModel):
+# State cannot inherit from BaseModel, as x509.name.Name does not play nice with PyDantic
+# Alternative is a DataClass, or no parent. Latter chosen.
+class State:
     """Application state."""
-
-    allowed_client_subject_dn: list[str] = []
+    # Note: if we inherit from BaseModel we get "Unable to generate pydantic-core
+    # schema for <class 'cryptography.x509.name.Name'>."
+    # So we do not inherit ;o)
+    allowed_client_subject_dn_names: list[x509.name.Name] = []
 
 
 def init_app() -> Flask:
@@ -93,109 +128,89 @@ state = State()
 app = init_app()
 
 
-def _escape_dn_value(value: str) -> str:
-    """Escape special characters in a DN attribute value per RFC 4514."""
-    value = value.replace("\\", "\\\\")
-    for ch in (",", "+", '"', "<", ">", ";"):
-        value = value.replace(ch, f"\\{ch}")
-    if value.startswith("#"):
-        value = "\\" + value
-    if value.startswith(" "):
-        value = "\\ " + value[1:]
-    if value.endswith(" "):
-        value = value[:-1] + "\\ "
-    return value
 
-
-def extract_dn_from_pem_header(header_value: str) -> str | None:
-    """Extract DN from Traefik's X-Forwarded-Tls-Client-Cert header (URL-encoded PEM).
-
-    Parses the full certificate to access all subject fields including
-    organizationIdentifier (OID 2.5.4.97) and emailAddress (OID 1.2.840.113549.1.9.1).
-    Returns a normalized DN string in DER field order, or None on parse failure.
-    """
-    try:
-        # Traefik strips newlines from the PEM before URL-encoding (to prevent header injection),
-        # so load_pem_x509_certificate would fail on the re-assembled string. Instead, extract
-        # the base64 between the PEM markers and load as DER.
-        # Use unquote (not unquote_plus) to preserve '+' characters valid in base64.
-        pem_str = unquote(header_value)
-        b64 = re.sub(r"-----[^-]+-----", "", pem_str).replace(" ", "")
-        cert = x509.load_der_x509_certificate(base64.b64decode(b64))
-    except Exception as e:
-        app.logger.warning(f"failed to parse PEM from X-Forwarded-Tls-Client-Cert: {e!s}")
-        return None
-
-    parts = [
-        f"{_OID_SHORT_NAMES.get(attr.oid, attr.oid.dotted_string)}={_escape_dn_value(attr.value)}"
-        for attr in cert.subject
-    ]
-    return ",".join(parts)
-
-
-def extract_dn_from_traefik_header(header_value: str) -> str | None:
-    """Extract DN from Traefik's X-Forwarded-Tls-Client-Cert-Info header.
-
-    Traefik format: Subject="CN=...,O=...,C=..."
-    Returns the DN string without the Subject="" wrapper, or None if not found.
-    """
-    # Match Subject="..." pattern and extract the DN
-    # Traefik URL-encodes the header value, so decode it first
-    match = re.search(r'Subject="([^"]+)"', unquote_plus(header_value))
-    if match:
-        return match.group(1)
-    return None
-
-
-def get_client_dn() -> tuple[str | None, str]:
-    """Extract client DN from request headers.
-
-    Priority order:
-    1. X-Forwarded-Tls-Client-Cert (Traefik PEM - all subject fields)
-    2. X-Forwarded-Tls-Client-Cert-Info (Traefik Info - limited fields)
-    3. ssl-client-subject-dn or configured header (nginx fallback)
+# Arno: pydantic cannot handle x509.Name
+def get_client_dn(): ### -> tuple[str | None, str]:
+    """Extract client DN from request headers, based on settings.tls_client_subject_authn_header
 
     Returns:
-        Tuple of (dn, source) where source indicates which header was used.
+        Tuple of (x509.Name, source) where source indicates which header was used.
     """
-    pem_header = request.headers.get("X-Forwarded-Tls-Client-Cert")
-    if pem_header:
-        dn = extract_dn_from_pem_header(pem_header)
-        if dn:
-            return dn, "traefik-pem"
+    try:
+        # https://werkzeug.palletsprojects.com/en/stable/datastructures/#werkzeug.datastructures.Headers
+        # .get() returns str
 
-    traefik_header = request.headers.get("X-Forwarded-Tls-Client-Cert-Info")
-    if traefik_header:
-        dn = extract_dn_from_traefik_header(traefik_header)
-        if dn:
-            return dn, "traefik"
+        # Risk: if ingress does DN header, and malicous actor sends cert header, and the
+        # proxy does not strip it, we would trust the cert header. So check only the
+        # header from settings.
+        #
+        authn_header_val = request.headers.get(settings.tls_client_subject_authn_header)
+        if not authn_header_val:
+            return None, "missing"
 
-    nginx_header = request.headers.get(settings.ssl_client_subject_dn_header)
-    if nginx_header:
-        return nginx_header, "nginx"
+        if settings.tls_client_subject_authn_header == K8S_TRAEFIK_TLS_CLIENT_CERT_HEADER:
+            if ',' in authn_header_val:
+                # Traefik sent a chain of certs, separated by , see above
+                try:
+                    pem_str_list = [v.strip() for v in authn_header_val.split(',') if v.strip()] if authn_header_val else []
+                    # Undocumented: assume client cert is first in list
+                    # This issue says client cert comes first: https://github.com/keycloak/keycloak/issues/46395#issuecomment-3915177071
+                    # Code suggest extra certs follow client cert: https://github.com/tdiesler/keycloak/commit/8d318c552a2c778b65265f4c46a3b30c7dc99a27#diff-4a1b33f7b0a6b8526caf3186df5ccd193f7efcb683dcff9e515de2765ec9fd19R236
+                    # "Traefik sends the client certificate and any intermediate CA certificates as PEM blocks in a single `X-Forwarded-Tls-Client-Cert` header, separated by commas."
+                    #  --- https://github.com/tdiesler/keycloak/commit/8d318c552a2c778b65265f4c46a3b30c7dc99a27#diff-4a1b33f7b0a6b8526caf3186df5ccd193f7efcb683dcff9e515de2765ec9fd19R288
+                    # If Traefik this is in PEM with some changes, see above
+                    pem_str = pem_str_list[0]
+                except:
+                    app.logger.warning(
+                        f"multiple certificates in {K8S_TRAEFIK_TLS_CLIENT_CERT_HEADER} header on HTTP request, could not parse")
+                    return None, "traefik-pem-multiple-certificates, bad parse"
+            else:
+                # If Traefik this is in PEM with some changes, see above
+                pem_str = authn_header_val
 
-    return None, "none"
+            dn = rfc4514_cmp.subject_dn_from_traefik_cert_pem(pem_str)
+            if dn:
+                return dn, "traefik-pem"
+
+        elif settings.tls_client_subject_authn_header == K8S_TRAEFIK_TLS_CLIENT_SUBJECT_DN_HEADER:
+            dn = rfc4514_cmp.subject_dn_from_traefik_cert_info(authn_header_val)
+            if dn:
+                return dn, "traefik-info"
+
+        elif settings.tls_client_subject_authn_header == K8S_NGINX_TLS_CLIENT_SUBJECT_DN_HEADER:
+            # DN is ASSUMEd to be sanitized as it comes from NGINX as RFC2253 DN...
+            dn = rfc4514_cmp.dn_rfc2253_string_to_rfc4514_name(authn_header_val)
+            if dn:
+                return dn, "nginx"
+        else:
+            # Default no name, higher layer logs and sends 403.
+            return None, "none"
+
+    except ValueError as e:
+            return None, str(e)
 
 
 @app.route("/validate", methods=["GET"])
 def validate() -> tuple[str, int]:
     """Verify the DN from the packet header against the list of allowed DN."""
-    dn, source = get_client_dn()
+    request_rfc4514_name, source = get_client_dn()
 
-    if not dn:
+    if request_rfc4514_name is None:
         app.logger.warning(
-            f"no client DN found in headers (tried X-Forwarded-Tls-Client-Cert, "
-            f"X-Forwarded-Tls-Client-Cert-Info, {settings.ssl_client_subject_dn_header})"
+            f"Missing authorization header or incorrect value: {settings.tls_client_subject_authn_header}: {source}"
         )
         return "Forbidden", 403
 
-    if dn not in state.allowed_client_subject_dn:
-        app.logger.info(f"deny {dn} (from {source} header)")
-        return "Forbidden", 403
+    # *** Main authentication line ***
+    # x509.Name object equals method does comparison
+    for allowed_dn_name in state.allowed_client_subject_dn_names:
 
-    app.logger.info(f"allow {dn} (from {source} header)")
-    return "OK", 200
+        if request_rfc4514_name == allowed_dn_name:
+            app.logger.info(f"allow {request_rfc4514_name} (from {source} header)")
+            return "OK", 200
 
+    app.logger.info(f"deny {request_rfc4514_name} (from {source} header)")
+    return "Forbidden", 403
 
 #
 # File watch based on watchdog.
@@ -254,22 +269,32 @@ def watch_file(filepath: FilePath, callback: Callable[[FilePath], None]) -> None
     event = threading.Event()
     threading.Thread(target=watch, daemon=True).start()
 
-
 #
 # Load DN from file.
 #
 def load_allowed_client_dn(filepath: FilePath) -> None:
     """Load list of allowed client DN from file."""
+    new_allowed_client_subject_dn_names = []
     try:
         with filepath.open("r") as f:
-            new_allowed_client_subject_dn = [line.strip() for line in f if line.strip()]
+            lines = [line.strip() for line in f if line.strip()]
     except Exception as e:
         app.logger.error(f"cannot load allowed client DN from {filepath}: {e!s}")
     else:
-        if state.allowed_client_subject_dn != new_allowed_client_subject_dn:
-            state.allowed_client_subject_dn = new_allowed_client_subject_dn
-            app.logger.info(f"load {len(new_allowed_client_subject_dn)} DN from {filepath}")
+        # Convert DNs from "free" file format into RFC4514 format for comparison against k8s ingress
+        # NGINX's "ssl-client-subject-dn" annotation header (also converted to RFC4514 format)
+        for line in lines:
+            try:
+                rfc4514_name = rfc4514_cmp.dn_tagvalue_string_to_rfc4514_name(line)
+            except ValueError:
+                app.logger.warning(f"Not a Distinguished Name {line} header in {filepath}")
+            else:
+                new_allowed_client_subject_dn_names.append(rfc4514_name)
 
+        # Detect change in persistent state vs run-time
+        if state.allowed_client_subject_dn_names != new_allowed_client_subject_dn_names:
+            state.allowed_client_subject_dn_names = new_allowed_client_subject_dn_names
+            app.logger.info(f"load {len(new_allowed_client_subject_dn_names)} DN from {filepath}")
 
 if settings.use_watchdog:
     watchdog_file(settings.allowed_client_subject_dn_path, load_allowed_client_dn)

@@ -22,7 +22,8 @@ from pytest import MonkeyPatch, fixture
 def allowed_client_dn(tmp_path: Path) -> Path:
     """Create a temporary file for testing client DNs."""
     path = tmp_path / "settings.json"
-    content = ("CN=CertA,OU=Dept X,O=Company Y,C=ZZ\n"
+    # Arno: someone did not use openssl x509 -nameopt rfc2253
+    content = ("C=ZZ,O=Company Y,OU=Dept X,CN=CertA\n"
                "CN=CertB,OU=Dept X,O=Company Y,C=ZZ\n")  # fmt: skip
     path.write_text(content, encoding="utf-8")
     return path

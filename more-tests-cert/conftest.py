@@ -22,8 +22,9 @@ from pytest import MonkeyPatch, fixture
 def allowed_client_dn(tmp_path: Path) -> Path:
     """Create a temporary file for testing client DNs."""
     path = tmp_path / "settings.json"
-    content = ("CN=CertA,OU=Dept X,O=Company Y,C=ZZ\n"
-               "CN=CertB,OU=Dept X,O=Company Y,C=ZZ\n")  # fmt: skip
+    # Arno: someone did not use openssl x509 -nameopt rfc2253
+    # Also add DN for chain of certs test
+    content = ("CN=Good CA,O=Test Certificates 2011,C=US\nCN=University Corporation For Advanced Internet Development,emailAddress=knewell@internet2.edu,organizationIdentifier=NTRUS\\+MI-801069584,O=University Corporation For Advanced Internet Development,ST=Michigan,C=US\n")  # fmt: skip
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -32,8 +33,9 @@ def allowed_client_dn(tmp_path: Path) -> Path:
 def application(allowed_client_dn: Path, monkeypatch: MonkeyPatch) -> Generator[Flask, None, None]:
     """Create and configure a new app instance for each test."""
     monkeypatch.setenv("allowed_client_subject_dn_path", str(allowed_client_dn))
-    # These tests are for NGINX Header-based auth
-    monkeypatch.setenv("tls_client_subject_authn_header", str("ssl-client-subject-dn"))
+    # These tests are for Cert-based auth
+    monkeypatch.setenv("tls_client_subject_authn_header", str("X-Forwarded-Tls-Client-Cert"))
+
     from nsi_auth import app
 
     app.config.update(
